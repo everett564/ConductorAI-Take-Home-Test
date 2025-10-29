@@ -1,4 +1,4 @@
-# PDF Maximum Number Finder (with NLP Enhancement)
+# PDF Maximum Number Finder
 
 Two Python tools to find the largest numerical value in a PDF document.
 
@@ -23,6 +23,7 @@ The NLP version understands contextual clues like:
 
 - Python 3.6 or higher
 - PyPDF2 library
+ - (Optional, for NLP-enhanced mode) spaCy + English model
 
 ## Installation
 
@@ -34,6 +35,14 @@ Or using requirements.txt:
 
 ```bash
 pip install -r requirements.txt
+```
+
+If you want the NLP-enhanced features (recommended), install spaCy and an English model:
+
+```powershell
+python -m pip install -r requirements.txt
+# then download the spaCy English model
+python -m spacy download en_core_web_sm
 ```
 
 ## Usage

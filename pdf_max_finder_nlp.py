@@ -8,8 +8,30 @@ Uses natural language processing to understand context and scale modifiers
 import re
 import sys
 from pathlib import Path
-from typing import List, Tuple, Dict
+from typing import List, Tuple, Optional
 import PyPDF2
+
+# Optional NLP: spaCy
+try:
+    import spacy
+    _SPACY_AVAILABLE = True
+except Exception:
+    spacy = None  # type: ignore
+    _SPACY_AVAILABLE = False
+
+def load_spacy_model(model_name: str = "en_core_web_sm"):
+    """Try to load a spaCy model. Returns the nlp object or None."""
+    if not _SPACY_AVAILABLE:
+        return None
+    try:
+        # Prefer a full model if installed
+        return spacy.load(model_name)
+    except Exception:
+        try:
+            # Fall back to a blank English pipeline (no NER)
+            return spacy.blank('en')
+        except Exception:
+            return None
 
 
 # Scale multipliers for common units
@@ -38,8 +60,7 @@ SCALE_MULTIPLIERS = {
     'mega': 1_000_000,
     'kilo': 1_000,
     
-    # Scientific notation indicators
-    'e': 1,  # Will be handled specially
+    # (scientific notation handled separately)
     
     # Financial/business terms
     'b': 1_000_000_000,  # Often used for billions in finance
@@ -70,10 +91,10 @@ def extract_text_from_pdf(pdf_path: str) -> str:
     return text
 
 
-def parse_scientific_notation(text: str) -> List[Tuple[float, str]]:
+def parse_scientific_notation(text: str) -> List[Tuple[float, str, int, int]]:
     """
-    Parse scientific notation like 1.23e6, 4.56e-3, 10^120
-    Returns list of (value, original_string) tuples
+    Parse scientific notation (e.g. 1.23e6) and power notation (e.g. 10^12).
+    Returns list of tuples (value, original_string, start_index, end_index).
     """
     results = []
     
@@ -84,7 +105,7 @@ def parse_scientific_notation(text: str) -> List[Tuple[float, str]]:
             base = float(match.group(1))
             exponent = int(match.group(2))
             value = base * (10 ** exponent)
-            results.append((value, match.group(0)))
+            results.append((value, match.group(0), match.start(), match.end()))
         except (ValueError, OverflowError):
             continue
     
@@ -97,23 +118,38 @@ def parse_scientific_notation(text: str) -> List[Tuple[float, str]]:
             # Limit exponent to prevent overflow
             if exponent <= 1000:
                 value = base ** exponent
-                results.append((value, match.group(0)))
+                results.append((value, match.group(0), match.start(), match.end()))
         except (ValueError, OverflowError):
             continue
     
     return results
 
 
-def extract_numbers_with_context(text: str, context_window: int = 50) -> List[Tuple[float, str]]:
+def extract_numbers_with_context(text: str, context_window: int = 50, nlp: Optional[object] = None) -> List[Tuple[float, str]]:
     """
     Extract numbers along with their surrounding context to detect scale modifiers.
     Returns list of (actual_value, context_string) tuples.
     """
     numbers_with_context = []
     
-    # First, handle scientific notation separately
+    # First, handle scientific notation separately (and keep spans to avoid duplicates)
+    used_spans = []  # list of (start, end) to dedupe
     sci_numbers = parse_scientific_notation(text)
-    numbers_with_context.extend(sci_numbers)
+    for value, orig, start, end in sci_numbers:
+        numbers_with_context.append((value, orig))
+        used_spans.append((start, end))
+
+    # If spaCy is available and a model was provided, use entity extraction first
+    if _SPACY_AVAILABLE and nlp is not None:
+        try:
+            # spacy-based extraction will return triples with spans for deduplication
+            spacy_results = extract_entities_with_spacy(nlp, text)
+            for val, ctx, span in spacy_results:
+                numbers_with_context.append((val, ctx))
+                used_spans.append(span)
+        except Exception:
+            # Fall back silently to regex approach if spaCy extraction fails
+            pass
     
     # Pattern to match numbers with various formats
     number_pattern = r'-?\$?\d{1,3}(?:,\d{3})+(?:\.\d+)?%?|-?\$?\d+\.?\d*%?'
@@ -121,6 +157,16 @@ def extract_numbers_with_context(text: str, context_window: int = 50) -> List[Tu
     for match in re.finditer(number_pattern, text):
         number_str = match.group(0)
         number_pos = match.start()
+        number_end = match.end()
+
+        # Skip if this span overlaps a previously-used span (from sci or spaCy)
+        overlap = False
+        for s, e in used_spans:
+            if not (number_end <= s or number_pos >= e):
+                overlap = True
+                break
+        if overlap:
+            continue
         
         # Get surrounding context
         context_start = max(0, number_pos - context_window)
@@ -129,8 +175,12 @@ def extract_numbers_with_context(text: str, context_window: int = 50) -> List[Tu
         
         # Extract the base number
         try:
-            cleaned = number_str.replace('$', '').replace(',', '').replace('%', '')
-            base_number = float(cleaned)
+            cleaned = number_str.replace('$', '').replace(',', '')
+            is_percent = '%' in number_str
+            base_number = float(cleaned.replace('%', ''))
+            if is_percent:
+                # Convert percent to fraction (e.g., 50% -> 0.5)
+                base_number = base_number / 100.0
         except ValueError:
             continue
         
@@ -167,7 +217,9 @@ def extract_numbers_with_context(text: str, context_window: int = 50) -> List[Tu
                 if abbrev in abbrev_multipliers:
                     multiplier = abbrev_multipliers[abbrev]
                     found_scale = abbrev.upper()
-        
+        # mark this regex match span as used to avoid duplicates later
+        used_spans.append((number_pos, number_end))
+
         actual_value = base_number * multiplier
         
         # Store with context information
@@ -179,6 +231,63 @@ def extract_numbers_with_context(text: str, context_window: int = 50) -> List[Tu
         numbers_with_context.append((actual_value, context_info))
     
     return numbers_with_context
+
+
+def extract_entities_with_spacy(nlp, text: str) -> List[Tuple[float, str, Tuple[int, int]]]:
+    """
+    Use spaCy NER to extract MONEY/QUANTITY/PERCENT entities and convert them to numeric values.
+    Returns list of (value, context_info, (start, end))
+    """
+    results: List[Tuple[float, str, Tuple[int, int]]] = []
+    if nlp is None:
+        return results
+
+    doc = nlp(text)
+
+    # Regex to find a numeric token inside the entity text
+    num_re = re.compile(r'-?\$?\d{1,3}(?:,\d{3})*(?:\.\d+)?%?|-?\$?\d+\.?\d*%?')
+
+    for ent in doc.ents:
+        if ent.label_ not in {'MONEY', 'QUANTITY', 'PERCENT', 'CARDINAL'}:
+            continue
+
+        ent_text = ent.text
+        m = num_re.search(ent_text)
+        if not m:
+            continue
+
+        number_str = m.group(0)
+        try:
+            cleaned = number_str.replace('$', '').replace(',', '')
+            is_percent = '%' in number_str or ent.label_ == 'PERCENT'
+            base_number = float(cleaned.replace('%', ''))
+            if is_percent:
+                base_number = base_number / 100.0
+        except ValueError:
+            continue
+
+        # Look for scale words in a small window after the entity
+        context_start = max(0, ent.start_char - 20)
+        context_end = min(len(text), ent.end_char + 50)
+        context = text[context_start:context_end].lower()
+
+        multiplier = 1.0
+        found_scale = None
+        for scale_word, scale_value in SCALE_MULTIPLIERS.items():
+            if re.search(rf'\b{re.escape(scale_word)}s?\b', context):
+                if scale_value > multiplier:
+                    multiplier = scale_value
+                    found_scale = scale_word
+
+        actual_value = base_number * multiplier
+        if found_scale:
+            context_info = f"{number_str} (scaled by {found_scale}: x{multiplier:,.0f})"
+        else:
+            context_info = number_str
+
+        results.append((actual_value, context_info, (ent.start_char, ent.end_char)))
+
+    return results
 
 
 def find_largest_number_nlp(pdf_path: str) -> Tuple[float, str, List[Tuple[float, str]]]:
@@ -199,7 +308,15 @@ def find_largest_number_nlp(pdf_path: str) -> Tuple[float, str, List[Tuple[float
     
     # Extract numbers with context
     print("Analyzing numbers with NLP context...")
-    numbers_with_context = extract_numbers_with_context(text)
+    # Try to load a spaCy model (if spaCy is installed). If no model is available
+    # we'll fall back to the original regex-based extraction.
+    nlp = None
+    if _SPACY_AVAILABLE:
+        nlp = load_spacy_model()
+        if nlp is None:
+            print("spaCy is installed but no model was found; falling back to regex heuristics.")
+
+    numbers_with_context = extract_numbers_with_context(text, nlp=nlp)
     
     if not numbers_with_context:
         print("Warning: No numbers found in document", file=sys.stderr)

@@ -1,1 +1,5 @@
 PyPDF2>=3.0.0
+spacy>=3.0.0
+
+# Note: To enable full NLP extraction install a spaCy model, e.g.:
+#   python -m spacy download en_core_web_sm
